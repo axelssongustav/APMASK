@@ -402,27 +402,27 @@ These are required before any inference method can be attempted.
 """
 
 class frozen_prior:
-    # Placeholder for the prior distribution.
-    # Hint: you may want to add input parameters to these methods.
 
-    def __init__(self):
-        raise NotImplementedError
+    def __init__(self, alpha_S = 2, theta_S = 500, alpha_lam = 4, theta_lam = 2.5e-4):
+        self.S0_prior = gamma(a=alpha_S, scale=theta_S)
+        self.lam_prior = gamma(a=alpha_lam, scale = theta_lam)
     
-    def rvs(self):
-        raise NotImplementedError
+    def rvs(self, size = 1):
+        S0 = self.S0_prior.rvs(size=size) #Shape (size,)
+        evals = self.lam_prior.rvs(size=(size,3)) #Shape (size, 3)
+        evecs = Rotation.random(size).as_matrix() #Shape (size, 3, 3)
+        return S0, evals, evecs
     
-    def logpdf(self):
-        raise NotImplementedError
-
+    def logpdf(self, S0, evals):
+        return self.S0_prior.logpdf(S0) + np.sum(self.lam_prior.logpdf(evals), axis = -1)
 
 class frozen_likelihood:
-    # Placeholder for the likelihood (with partial code provided).
-    # Hint: you may want to add input parameters to these methods.
 
-    def __init__(self, gtab):
+
+    def __init__(self, gtab, y, sigma=29):
         self.gtab = gtab   # store gradient table with b-values and b-vectors
-
-        raise NotImplementedError
+        self.y = np.asarray(y, dtype=float)   # measured signal of our voxel, shape (N,)
+        self.sigma = sigma                    # noise standard deviation, Table 1
 
     def logpdf(self, S0, evecs, evals):
         S0 = np.atleast_1d(S0)        # ensure S0 is array-like
@@ -434,10 +434,52 @@ class frozen_likelihood:
 
         # Model signal S given tensor D and baseline S0
         S = S0[:, None] * np.exp( - np.einsum('...j, ijk, ...k->i...', q, D, q))
-        
-        raise NotImplementedError
 
+        #Gaussian log density of each measurement, summed over measurements, shape (B,)
+        return np.sum(norm.logpdf(self.y, loc=S, scale=self.sigma), axis=1)
 
+    def rvs(self, S0, evecs, evals, size=1):
+        S0 = np.atleast_1d(S0)
+        D = compute_D(evals, evecs)
+        q = np.sqrt(self.gtab.bvals[:, None]) * self.gtab.bvecs
+        S = S0[:, None] * np.exp( - np.einsum('...j, ijk, ...k->i...', q, D, q))
+
+        #Predicted signal plus Gaussian noise, shape (size, B, N)
+        return norm.rvs(loc=S, scale=self.sigma, size=(size,) + S.shape)
+
+def check_model():
+    #Check the prior and likelihood before any inference method uses them
+    y, point_estimate, gtab = get_preprocessed_data()
+    S0_hat, evals_hat, evecs_hat = point_estimate
+    prior = frozen_prior()
+    likelihood = frozen_likelihood(gtab, y)
+
+    #For prior, sample means should match the theoretical means (Gamma mean = shape * scale)
+    S0, evals, evecs = prior.rvs(size=100000)
+    print("Prior mean of S0:", S0.mean(), " theory:", 2 * 500)
+    print("Prior mean of eigenvalues:", evals.mean(axis=0), " theory:", 4 * 2.5e-4)
+    print("Prior mean of D (should be close to 0.001 * identity):")
+    print(compute_D(evals, evecs).mean(axis=0))
+
+    #Predicted signal at DIPY's estimate, Eq. (1)
+    D_hat = compute_D(evals_hat, evecs_hat)[0]
+    q = np.sqrt(gtab.bvals[:, None]) * gtab.bvecs
+    S_hat = S0_hat * np.exp(-np.sum((q @ D_hat) * q, axis=1))
+
+    #For likelihood, simulated data should average to the predicted signal, with spread sigma
+    y_sim = likelihood.rvs(S0_hat, evecs_hat, evals_hat, size=10000)[:, 0, :]
+    print("Largest gap between mean of simulated y and predicted signal:",
+          np.max(np.abs(y_sim.mean(axis=0) - S_hat)), " (should be about 1 or less)")
+    print("Std of simulated y:", y_sim.std(axis=0).mean(), " theory:", 29)
+
+    #(Likelihood) The real data should look like the prediction plus noise of size sigma
+    print("Residual std at DIPY fit:", (y - S_hat).std(), " sigma in model:", 29)
+
+    #(Likelihood) DIPY's fit
+    ll_hat = likelihood.logpdf(S0_hat, evecs_hat, evals_hat)[0]
+    ll_random = likelihood.logpdf(S0[:1000], evecs[:1000], evals[:1000])
+    print("Log-likelihood at DIPY fit:", ll_hat, " best of 1000 prior draws:", ll_random.max())
+    print("Log prior at DIPY fit:", prior.logpdf(S0_hat, evals_hat))
 
 """
 =============================================================================
@@ -716,3 +758,4 @@ def plot_results(S0, evals, evecs, evec_ref, weights=None, method=""):
 
 if __name__ == "__main__":
     main()
+    check_model()
