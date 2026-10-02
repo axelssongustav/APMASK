@@ -851,9 +851,9 @@ def main():
     # burn_in = 0
     # plot_results(S0_mh[burn_in:], evals_mh[burn_in:], evecs_mh[burn_in:, :, :], evec_principal, method="mh")
 
-    # # Run Importance Sampling and plot results
-    # w_is, S0_is, evals_is, evecs_is = importance_sampling(force_recompute=False)
-    # plot_results(S0_is, evals_is, evecs_is, evec_principal, weights=w_is, method="is")
+    # Run Importance Sampling and plot results
+    w_is, S0_is, evals_is, evecs_is = importance_sampling(force_recompute=True)
+    plot_results(S0_is, evals_is, evecs_is, evec_principal, weights=w_is, method="is")
 
     # Run Variational Inference and plot results
     posterior_vi = variational_inference(force_recompute=True)
@@ -865,6 +865,16 @@ def main():
     # posterior_laplace = laplace_approximation(force_recompute=False)
     # S0_laplace, evals_laplace, evecs_laplace = posterior_laplace.rvs(size=n_samples)
     # plot_results(S0_laplace, evals_laplace, evecs_laplace, evec_principal, method="laplace")
+
+
+    # Resample IS according to its weights so both methods give unweighted samples
+    idx = np.random.choice(len(w_is), size=len(w_is), p=w_is)
+
+    for name, S0, evals in [("IS", S0_is[idx], evals_is[idx]), ("VI", S0_vi, evals_vi)]:
+        print(f"\n{name} 95% credible intervals:")
+        print("S0:", np.percentile(S0, [2.5, 97.5]))
+        print("MD:", np.percentile(dti.mean_diffusivity(evals), [2.5, 97.5]))
+        print("FA:", np.percentile(dti.fractional_anisotropy(evals), [2.5, 97.5]))
 
     print("Done.")
     # Plot the ELBO after VI has finished
@@ -962,6 +972,7 @@ def plot_results(S0, evals, evecs, evec_ref, weights=None, method=""):
     # Adjust layout and save figure with method name
     plt.tight_layout()
     plt.savefig("results_{}.png".format(method), dpi=300, bbox_inches='tight')
+
 
 
 
