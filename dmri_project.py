@@ -589,18 +589,63 @@ def importance_sampling(*args, **kwargs):
     # (e.g. pass initialization values like those prepared in main()).
 
     n_samples = kwargs.get('n_samples', 2000)
+    gamma_S = kwargs.get('gamma_S', 0.02)
+    nu = kwargs.get('nu', 4000)
+
     y, point_estimate, gtab = get_preprocessed_data()
     S0_init, evals_init, evecs_init = point_estimate
+    D_init = compute_D(evals_init, evecs_init)[0]
 
-    S0_samples = np.random.normal(loc=S0_init, scale=max(1e-2, 0.05 * S0_init), size=n_samples)
-    evals_samples = np.maximum(1e-9, np.random.normal(loc=evals_init, scale=0.05 * evals_init, size=(n_samples, 3)))
-    evecs_samples = np.repeat(evecs_init[None, :, :], n_samples, axis=0)
-    importance_weights = np.ones(n_samples) / n_samples
+    prior = frozen_prior()
+    likelihood = frozen_likelihood(gtab, y)
+
+    proposal_S0 = gamma(a=gamma_S**-2, scale=gamma_S**2 * S0_init)
+    proposal_D = wishart(df=nu, scale=D_init / nu)
+
+    S0_samples = proposal_S0.rvs(size=n_samples)
+    D_samples = proposal_D.rvs(size=n_samples)
+    evals_samples, evecs_samples = np.linalg.eigh(D_samples)
+
+    log_q = proposal_S0.logpdf(S0_samples) + proposal_D.logpdf(np.moveaxis(D_samples, 0, -1))
+
+    l1, l2, l3 = evals_samples[:, 0], evals_samples[:, 1], evals_samples[:, 2]
+    log_jacobian = np.log(l2 - l1) + np.log(l3 - l1) + np.log(l3 - l2)
+    log_prior = prior.logpdf(S0_samples, evals_samples) - log_jacobian
+    log_lik = likelihood.logpdf(S0_samples, evecs_samples, evals_samples)
+
+    log_w = log_prior + log_lik - log_q
+    importance_weights = np.exp(log_w - logsumexp(log_w))
 
     return importance_weights, S0_samples, evals_samples, evecs_samples
 
 
-@disk_memoize()
+def tune_importance_sampling():
+    """Small, readable grid search for gamma_S and nu."""
+    best_gamma = None
+    best_nu = None
+    best_ess = -np.inf
+
+    for gamma_S in [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.1]:
+        for nu in [2000, 5000, 10000, 20000, 40000, 80000]:
+            weights, _, _, _ = importance_sampling(
+                force_recompute=True,
+                n_samples=2000,
+                gamma_S=gamma_S,
+                nu=nu,
+            )
+            ess = 1.0 / np.sum(weights**2)
+
+            if ess > best_ess:
+                best_ess = ess
+                best_gamma = gamma_S
+                best_nu = nu
+
+            print(f"gamma_S={gamma_S:.2f} nu={nu:7d} ESS={ess:8.1f}")
+
+    print("BEST:", best_gamma, best_nu, "ESS=", round(best_ess, 1))
+    return (best_gamma, best_nu), best_ess
+
+
 def variational_inference(*args, **kwargs):
     # Students: implement Variational Inference here.
     # Before starting, make sure the prior, likelihood and variational_posterior are implemented.
@@ -622,7 +667,6 @@ def variational_inference(*args, **kwargs):
     return SimplePosterior()
 
 
-@disk_memoize()
 def laplace_approximation(*args, **kwargs):
     # Students: implement the Laplace Approximation here.
     # Before starting, make sure the prior, likelihood and mvn_reparameterized are implemented.
