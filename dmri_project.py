@@ -654,7 +654,6 @@ def importance_sampling(*args, **kwargs):
     return importance_weights, S0_samples, evals_samples, evecs_samples
 
 
-<<<<<<< HEAD
 def tune_importance_sampling():
     """Small, readable grid search for gamma_S and nu."""
     best_gamma = None
@@ -682,11 +681,17 @@ def tune_importance_sampling():
     return (best_gamma, best_nu), best_ess
 
 
-def variational_inference(*args, **kwargs):
-=======
-@disk_memoize()
-def variational_inference(n_iterations = 10000, K = 50, learning_rate = 5e-3, theta_init = None, seed = 0, verbose = True):
->>>>>>> origin/main
+def variational_inference(
+    n_iterations=10000,
+    K=50,
+    learning_rate=5e-3,
+    theta_init=None,
+    seed=0,
+    verbose=True,
+    *args,
+    **kwargs,
+):
+
     # Students: implement Variational Inference here.
     # Before starting, make sure the prior, likelihood and variational_posterior are implemented.
     # Note: you may change, add, or remove input parameters depending on your design
