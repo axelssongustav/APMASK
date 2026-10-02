@@ -499,14 +499,49 @@ class variational_posterior:
     # The score() method is already implemented and can be used later
     # when implementing inference (with REINFORCE leave-one-out estimator).
 
-    def __init__(self):
-        raise NotImplementedError
+    def __init__(self, theta):
+        theta = np.asarray(theta, dtype=float)
+        if theta.shape != (9,):
+            raise ValueError("Theta needs shape 9")
+        self.theta = theta.copy()
 
-    def logpdf(self):
-        raise NotImplementedError
-    
+        #q(SO), gamma(alpha/shape, beta/scale)
+        self.shape = np.exp(theta[0])
+        self.scale = np.exp(theta[1])
+
+        #q(D), Wishart params, call mean matrix Sigma
+        self.Sigma = D_from_theta(theta[2:8])
+        self.df = np.exp(theta[8]) + 2.0
+
+    def logpdf(self, S0, D):
+        #dimension check/fix so all is in correct shape
+        S0 = np.atleast_1d(S0)
+        D = np.asarray(D)
+        if D.ndim == 2:
+            D = D[None, :, :]
+        
+        #define the logs
+        log_q_S0 = gamma.logpdf(S0, a = self.shape, scale = self.scale)
+
+        q_D = wishart(df = self.df, scale = self.Sigma/self.df)
+        log_q_D = np.array([q_D.logpdf(D_i) for D_i in D])
+
+        return log_q_S0 + log_q_D
+
     def rvs(self, size):
-        raise NotImplementedError
+        #sample S0
+        S0_samples = gamma.rvs(a = self.shape, scale = self.scale, size = size)
+
+        #sample diffusion tensors
+        D_samples = wishart.rvs(self.df, scale = self.Sigma/self.df, size = size)
+
+        #make sure we get the dimensions right
+        D_samples = np.asarray(D_samples)
+        if D_samples.ndim == 2:
+            D_samples = D_samples[None, :, :]
+
+        #compute eigenvalues of samples, use fact D symmetric
+        evals_samples, evecs_samples = np.linalg.eigh(D_samples)
 
         return S0_samples, evals_samples, evecs_samples
 
@@ -515,7 +550,7 @@ class variational_posterior:
         score_wrt_log_shape, score_wrt_log_scale = self.gamma_score(S0)
         score_wrt_theta, score_wrt_log_df = self.wishart_score(D)
         return np.concatenate([
-            score_wrt_log_shape, score_wrt_log_scale, score_wrt_theta, score_wrt_log_df]
+            np.atleast_1d(score_wrt_log_shape), np.atleast_1d(score_wrt_log_scale), np.atleast_1d(score_wrt_theta), np.atleast_1d(score_wrt_log_df)]
         )
 
     def gamma_score(self, x):
@@ -601,26 +636,118 @@ def importance_sampling(*args, **kwargs):
 
 
 @disk_memoize()
-def variational_inference(*args, **kwargs):
+def variational_inference(n_iterations = 10000, K = 50, learning_rate = 5e-3, theta_init = None, seed = 0, verbose = True):
     # Students: implement Variational Inference here.
     # Before starting, make sure the prior, likelihood and variational_posterior are implemented.
     # Note: you may change, add, or remove input parameters depending on your design
     # (e.g. pass initialization values like those prepared in main()).
 
-    # Return a simple object with rvs(size) method producing samples
-    n_samples = kwargs.get('n_samples', 2000)
+    #initialize all we need
+    np.random.seed(seed)
     y, point_estimate, gtab = get_preprocessed_data()
     S0_init, evals_init, evecs_init = point_estimate
 
-    class SimplePosterior:
-        def rvs(self, size):
-            S0 = np.random.normal(loc=S0_init, scale=max(1e-2, 0.05 * S0_init), size=size)
-            evals = np.maximum(1e-9, np.random.normal(loc=evals_init, scale=0.05 * evals_init, size=(size, 3)))
-            evecs = np.repeat(evecs_init[None, :, :], size, axis=0)
-            return S0, evals, evecs
+    S0_init = float(np.asarray(S0_init).squeeze())
+    D_init = compute_D(evals_init, evecs_init).squeeze()
 
-    return SimplePosterior()
+    prior = frozen_prior()
+    likelihood = frozen_likelihood(gtab, y)
 
+    #get the nine variational parameters, draw them if none are given
+    if theta_init is None:
+        initial_gamma_shape = 10
+        initial_gamma_scale = S0_init/initial_gamma_shape
+        initial_df = 10
+
+        theta = np.concatenate([
+            np.array([
+                np.log(initial_gamma_shape),
+                np.log(initial_gamma_scale)]), #convert them back from exponents
+                theta_from_D(D_init), #get thetas from D
+                np.array([np.log(initial_df - 2.0)]) #again convert back
+                ])
+    else:
+        theta = np.asarray(theta_init, dtpye = float).copy()
+        #check that the given theta has right shape
+        if theta.shape != (9,):
+            raise ValueError("Theta needs correct shape (9,)")
+
+    #setup Adam algorithm, parameter values taken from geeksforgeeks
+    beta1 = 0.9
+    beta2 = 0.999
+    epsilon = 1e-8
+
+    first_moment = np.zeros_like(theta)
+    second_moment = np.zeros_like(theta)
+
+    #define so we can monitor the optimization progress
+    elbo_history = []
+    progress_every = max(1, n_iterations // 10)
+
+    for iteration in range(1, n_iterations + 1):
+        #distribution with current theta
+        posterior = variational_posterior(theta)
+
+        #draw K samples 
+        S0_samples, evals_samples, evecs_samples = posterior.rvs(K)
+
+        #compute D
+        D_samples = compute_D(evals_samples, evecs_samples)
+
+        #compute the log joint distribution
+        log_joint = (
+            likelihood.logpdf(S0_samples, evecs_samples, evals_samples) +
+            prior.logpdf(S0_samples, evals_samples)
+            )  
+
+        #compute f_k = log p(y, z_k) - log q_theta(z_k)    
+        log_q = posterior.logpdf(S0_samples, D_samples)    
+        f_values = log_joint - log_q
+
+        #keep a monte carlo estimate for monotoring
+        elbo_history.append(np.mean(f_values))
+
+        #compute scores, one vector per sample
+        scores = np.stack([posterior.score(S0_samples[k], D_samples[k]) for k in range(K)])
+
+        #leave one out baseline
+        total_f = np.sum(f_values)
+        baselines = (total_f - f_values) / (K-1)
+
+        relative_f_values = f_values - baselines
+
+        #reinforce leave one out estimator of gradient
+        gradient = np.mean(relative_f_values[:, None] * scores, axis = 0)
+
+        #perform Adam
+        first_moment = (beta1 * first_moment) + ((1.0 - beta1) * gradient)
+
+        second_moment = (beta2 * second_moment) + ((1 - beta2) * gradient**2)
+
+        first_moment_corrected = first_moment / (1 - beta1**iteration)
+
+        second_moment_corrected = second_moment / (1 - beta2**iteration)
+
+        #use a + sign since we maximize
+        theta += learning_rate * first_moment_corrected / (np.sqrt(second_moment_corrected) + epsilon)
+
+        if (
+            verbose
+            and (
+                iteration == 1
+                or iteration % progress_every == 0
+                or iteration == n_iterations
+            )
+        ):
+            print(
+                f"Iteration {iteration:5d}/{n_iterations}: "
+                f"ELBO estimate = {elbo_history[-1]:.3f}"
+            )
+
+    posterior = variational_posterior(theta)
+    posterior.elbo_history = np.asarray(elbo_history)
+
+    return posterior
 
 @disk_memoize()
 def laplace_approximation(*args, **kwargs):
@@ -665,27 +792,54 @@ def main():
     np.random.seed(0)
     n_samples = 10000
 
-    # Run Metropolis–Hastings and plot results
-    S0_mh, evals_mh, evecs_mh = metropolis_hastings(force_recompute=False)
-    burn_in = 0
-    plot_results(S0_mh[burn_in:], evals_mh[burn_in:], evecs_mh[burn_in:, :, :], evec_principal, method="mh")
+    # # Run Metropolis–Hastings and plot results
+    # S0_mh, evals_mh, evecs_mh = metropolis_hastings(force_recompute=False)
+    # burn_in = 0
+    # plot_results(S0_mh[burn_in:], evals_mh[burn_in:], evecs_mh[burn_in:, :, :], evec_principal, method="mh")
 
-    # Run Importance Sampling and plot results
-    w_is, S0_is, evals_is, evecs_is = importance_sampling(force_recompute=False)
-    plot_results(S0_is, evals_is, evecs_is, evec_principal, weights=w_is, method="is")
+    # # Run Importance Sampling and plot results
+    # w_is, S0_is, evals_is, evecs_is = importance_sampling(force_recompute=False)
+    # plot_results(S0_is, evals_is, evecs_is, evec_principal, weights=w_is, method="is")
 
     # Run Variational Inference and plot results
-    posterior_vi = variational_inference(force_recompute=False)
+    posterior_vi = variational_inference(force_recompute=True)
     S0_vi, evals_vi, evecs_vi = posterior_vi.rvs(size=n_samples)
     plot_results(S0_vi, evals_vi, evecs_vi, evec_principal, method="vi")
 
-    # Run Laplace Approximation and plot results
-    posterior_laplace = laplace_approximation(force_recompute=False)
-    S0_laplace, evals_laplace, evecs_laplace = posterior_laplace.rvs(size=n_samples)
-    plot_results(S0_laplace, evals_laplace, evecs_laplace, evec_principal, method="laplace")
+
+    # # Run Laplace Approximation and plot results
+    # posterior_laplace = laplace_approximation(force_recompute=False)
+    # S0_laplace, evals_laplace, evecs_laplace = posterior_laplace.rvs(size=n_samples)
+    # plot_results(S0_laplace, evals_laplace, evecs_laplace, evec_principal, method="laplace")
 
     print("Done.")
+    # Plot the ELBO after VI has finished
+    elbo = posterior_vi.elbo_history
 
+    plt.figure()
+    plt.plot(elbo, alpha=0.3, label="Raw ELBO estimate")
+
+    # Moving average to make the overall trend visible
+    window = 100
+    smoothed_elbo = np.convolve(
+        elbo,
+        np.ones(window) / window,
+        mode="valid"
+    )
+
+    plt.plot(
+        np.arange(window - 1, len(elbo)),
+        smoothed_elbo,
+        linewidth=2,
+        label="100-iteration moving average"
+    )
+
+    plt.xlabel("Iteration")
+    plt.ylabel("Estimated ELBO")
+    plt.title("Variational inference convergence")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.savefig("Convergence_VI.png", dpi=300, bbox_inches='tight')
 
 def plot_results(S0, evals, evecs, evec_ref, weights=None, method=""):
     """
@@ -756,6 +910,8 @@ def plot_results(S0, evals, evecs, evec_ref, weights=None, method=""):
     plt.savefig("results_{}.png".format(method), dpi=300, bbox_inches='tight')
 
 
+
 if __name__ == "__main__":
     main()
     check_model()
+
