@@ -623,9 +623,9 @@ def importance_sampling(*args, **kwargs):
     # Note: you may change, add, or remove input parameters depending on your design
     # (e.g. pass initialization values like those prepared in main()).
 
-    n_samples = kwargs.get('n_samples', 2000)
-    gamma_S = kwargs.get('gamma_S', 0.02)
-    nu = kwargs.get('nu', 4000)
+    n_samples = kwargs.get('n_samples', 10000)
+    gamma_S = kwargs.get('gamma_S', 0.008979591836734694)
+    nu = kwargs.get('nu', 1000)
 
     y, point_estimate, gtab = get_preprocessed_data()
     S0_init, evals_init, evecs_init = point_estimate
@@ -655,29 +655,32 @@ def importance_sampling(*args, **kwargs):
 
 
 def tune_importance_sampling():
-    """Small, readable grid search for gamma_S and nu."""
+    """Broader but still lightweight ESS search for the IS proposal."""
     best_gamma = None
     best_nu = None
     best_ess = -np.inf
 
-    for gamma_S in [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.1]:
-        for nu in [2000, 5000, 10000, 20000, 40000, 80000]:
+    gamma_values = np.linspace(0.005, 0.2, 20)
+    nu_values = [1000, 2000, 5000, 10000, 20000, 40000, 80000, 150000]
+
+    for gamma_S in gamma_values:
+        for nu in nu_values:
             weights, _, _, _ = importance_sampling(
                 force_recompute=True,
                 n_samples=2000,
-                gamma_S=gamma_S,
-                nu=nu,
+                gamma_S=float(gamma_S),
+                nu=int(nu),
             )
             ess = 1.0 / np.sum(weights**2)
 
             if ess > best_ess:
                 best_ess = ess
-                best_gamma = gamma_S
-                best_nu = nu
+                best_gamma = float(gamma_S)
+                best_nu = int(nu)
 
-            print(f"gamma_S={gamma_S:.2f} nu={nu:7d} ESS={ess:8.1f}")
+            print(f"gamma_S={gamma_S:.4f} nu={nu:7d} ESS={ess:10.2f}")
 
-    print("BEST:", best_gamma, best_nu, "ESS=", round(best_ess, 1))
+    print("BEST:", best_gamma, best_nu, "ESS=", round(best_ess, 2))
     return (best_gamma, best_nu), best_ess
 
 
@@ -839,8 +842,8 @@ def main():
     S0_init, evals_init, evecs_init = point_estimate
     D_init = compute_D(evals_init, evecs_init).squeeze()
 
-    # Find principal eigenvector from DTI estimate (for plotting)
-    evec_principal = evecs_init[:, 0]
+    # Find the principal eigenvector from the DTI estimate (for plotting)
+    evec_principal = evecs_init[:, np.argmax(evals_init)]
 
     # Set random seed and number of posterior samples
     np.random.seed(0)
@@ -851,8 +854,15 @@ def main():
     # burn_in = 0
     # plot_results(S0_mh[burn_in:], evals_mh[burn_in:], evecs_mh[burn_in:, :, :], evec_principal, method="mh")
 
-    # Run Importance Sampling and plot results
-    w_is, S0_is, evals_is, evecs_is = importance_sampling(force_recompute=True)
+    # Run Importance Sampling and plot results with the tuned proposal
+    # (seeded inside the function, so the figure is the same on every run)
+    w_is, S0_is, evals_is, evecs_is = importance_sampling(
+        force_recompute=True,
+        n_samples=n_samples,
+        gamma_S=GAMMA_S_TUNED,
+        nu=NU_TUNED,
+        seed=0,
+    )
     plot_results(S0_is, evals_is, evecs_is, evec_principal, weights=w_is, method="is")
 
     # Run Variational Inference and plot results
@@ -860,21 +870,76 @@ def main():
     S0_vi, evals_vi, evecs_vi = posterior_vi.rvs(size=n_samples)
     plot_results(S0_vi, evals_vi, evecs_vi, evec_principal, method="vi")
 
+    # Importance sampling with the alternative (adapted Student-t) proposal
+    w_ais, S0_ais, evals_ais, evecs_ais, ess_history = adaptive_importance_sampling(
+        posterior_vi, n_samples=n_samples, seed=0
+    )
+    plot_results(S0_ais, evals_ais, evecs_ais, evec_principal, weights=w_ais, method="is_adaptive")
+
+    # ESS of the three proposals over 10 seeds (fixed, variational, adapted)
+    ess_fixed = [1 / np.sum(importance_sampling.__wrapped__(n_samples=n_samples, seed=s)[0]**2)
+                 for s in range(10)]
+    ess_adapt = np.array([adaptive_importance_sampling(posterior_vi, n_samples=n_samples, seed=s)[4]
+                          for s in range(10)])
+    print(f"\nESS out of {n_samples}, mean +- std over 10 seeds")
+    print(f"  fixed proposal (gamma_S={GAMMA_S_TUNED}, nu={NU_TUNED}): "
+          f"{np.mean(ess_fixed):.0f} +- {np.std(ess_fixed):.0f}  (seed 0: {1 / np.sum(w_is**2):.0f})")
+    print(f"  variational proposal: {ess_adapt[:, 0].mean():.0f} +- {ess_adapt[:, 0].std():.0f}")
+    print(f"  adapted Student-t proposal: {ess_adapt[:, -1].mean():.0f} +- {ess_adapt[:, -1].std():.0f}"
+          f"  (seed 0: {ess_history[-1]:.0f})")
+
+    # Posterior dependence between S0 and MD, which the factorized proposals cannot represent
+    c = np.cov(np.vstack([S0_ais, dti.mean_diffusivity(evals_ais)]), aweights=w_ais)
+    print(f"  posterior correlation of S0 and MD (adapted IS): {c[0, 1] / np.sqrt(c[0, 0] * c[1, 1]):.2f}")
+
+    # 95% credible intervals (Table 1 in the report)
+    print("\n95% equal-tailed credible intervals [2.5%, 50%, 97.5%]")
+    print_intervals("IS, fixed proposal", S0_is, evals_is, evecs_is, evec_principal, w_is)
+    print_intervals("IS, adapted proposal", S0_ais, evals_ais, evecs_ais, evec_principal, w_ais)
+    print_intervals("VI", S0_vi, evals_vi, evecs_vi, evec_principal)
+
+    plot_comparison(
+        [(S0_is, evals_is, evecs_is, w_is, "IS, fixed proposal"),
+         (S0_ais, evals_ais, evecs_ais, w_ais, "IS, adapted proposal"),
+         (S0_vi, evals_vi, evecs_vi, None, "VI")],
+        evec_principal,
+    )
+
+
 
     # # Run Laplace Approximation and plot results
     # posterior_laplace = laplace_approximation(force_recompute=False)
     # S0_laplace, evals_laplace, evecs_laplace = posterior_laplace.rvs(size=n_samples)
     # plot_results(S0_laplace, evals_laplace, evecs_laplace, evec_principal, method="laplace")
 
+    print("Done.")
+    # Plot the ELBO after VI has finished
+    elbo = posterior_vi.elbo_history
 
-    # Resample IS according to its weights so both methods give unweighted samples
-    idx = np.random.choice(len(w_is), size=len(w_is), p=w_is)
+    plt.figure()
+    plt.plot(elbo, alpha=0.3, label="Raw ELBO estimate")
 
-    for name, S0, evals in [("IS", S0_is[idx], evals_is[idx]), ("VI", S0_vi, evals_vi)]:
-        print(f"\n{name} 95% credible intervals:")
-        print("S0:", np.percentile(S0, [2.5, 97.5]))
-        print("MD:", np.percentile(dti.mean_diffusivity(evals), [2.5, 97.5]))
-        print("FA:", np.percentile(dti.fractional_anisotropy(evals), [2.5, 97.5]))
+    # Moving average to make the overall trend visible
+    window = 100
+    smoothed_elbo = np.convolve(
+        elbo,
+        np.ones(window) / window,
+        mode="valid"
+    )
+
+    plt.plot(
+        np.arange(window - 1, len(elbo)),
+        smoothed_elbo,
+        linewidth=2,
+        label="100-iteration moving average"
+    )
+
+    plt.xlabel("Iteration")
+    plt.ylabel("Estimated ELBO")
+    plt.title("Variational inference convergence")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.savefig("Convergence_VI.png", dpi=300, bbox_inches='tight')
 
     print("Done.")
     # Plot the ELBO after VI has finished
@@ -943,9 +1008,24 @@ def plot_results(S0, evals, evecs, evec_ref, weights=None, method=""):
     md = dti.mean_diffusivity(evals).squeeze()
     fa = dti.fractional_anisotropy(evals).squeeze()
 
-    # Compute acute angle between estimated and reference eigenvectors
-    angle = 360/(2*np.pi) * np.arccos(np.abs(np.dot(evecs[:, :, 2], evec_ref)))
-    
+    # Compute the acute angle between each sample's principal diffusion direction
+    # and the reference principal direction. The eigenvector ordering is not
+    # guaranteed to match the principal axis across all samples, so we select the
+    # eigenvector corresponding to the largest eigenvalue in each sample.
+    if evecs.ndim == 3 and evals.ndim == 2:
+        principal_idx = np.argmax(evals, axis=1)
+        principal_evecs = np.stack(
+            [evecs[i, :, principal_idx[i]] for i in range(len(evals))],
+            axis=0,
+        )
+        angle = np.degrees(
+            np.arccos(np.clip(np.abs(np.sum(principal_evecs * evec_ref, axis=1)), -1.0, 1.0))
+        )
+    else:
+        angle = np.degrees(
+            np.arccos(np.clip(np.abs(np.dot(evecs[:, :, 2], evec_ref)), -1.0, 1.0))
+        )
+
     # Create 2x2 grid of histograms
     fig, axes = plt.subplots(2, 2, figsize=(12, 12), sharey=False)
 
