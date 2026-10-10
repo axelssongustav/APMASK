@@ -67,7 +67,7 @@ import matplotlib.pyplot as plt
 
 # SciPy: probability distributions, math functions, and optimization
 # Hint: these tools might be useful later in the project
-from scipy.stats import gamma, norm, wishart, multivariate_normal
+from scipy.stats import gamma, norm, wishart, multivariate_normal, multivariate_t
 from scipy.spatial.transform import Rotation
 from scipy.special import logsumexp, digamma
 from scipy.optimize import minimize
@@ -616,6 +616,14 @@ def metropolis_hastings(*args, **kwargs):
     return S0_samples, evals_samples, evecs_samples
 
 
+def log_jacobian_eig(evals):
+    #log of (l2-l1)(l3-l1)(l3-l2), the Jacobian of D -> (eigenvalues, eigenvectors).
+    #Subtract it from prior.logpdf to get the prior as a density over the matrix D,
+    #which is needed whenever the proposal / variational family is a density over D.
+    e = np.sort(evals, axis=-1)
+    l1, l2, l3 = e[..., 0], e[..., 1], e[..., 2]
+    return np.log(l2 - l1) + np.log(l3 - l1) + np.log(l3 - l2)
+
 @disk_memoize()
 def importance_sampling(*args, **kwargs):
     # Students: implement Importance Sampling here.
@@ -624,8 +632,13 @@ def importance_sampling(*args, **kwargs):
     # (e.g. pass initialization values like those prepared in main()).
 
     n_samples = kwargs.get('n_samples', 10000)
-    gamma_S = kwargs.get('gamma_S', 0.008979591836734694)
-    nu = kwargs.get('nu', 1000)
+    gamma_S = kwargs.get('gamma_S', GAMMA_S_TUNED)
+    nu = kwargs.get('nu', NU_TUNED)
+    seed = kwargs.get('seed', 0)
+
+    #Fixed seed so that the same call always gives the same samples and figure
+    if seed is not None:
+        np.random.seed(seed)
 
     y, point_estimate, gtab = get_preprocessed_data()
     S0_init, evals_init, evecs_init = point_estimate
@@ -643,9 +656,7 @@ def importance_sampling(*args, **kwargs):
 
     log_q = proposal_S0.logpdf(S0_samples) + proposal_D.logpdf(np.moveaxis(D_samples, 0, -1))
 
-    l1, l2, l3 = evals_samples[:, 0], evals_samples[:, 1], evals_samples[:, 2]
-    log_jacobian = np.log(l2 - l1) + np.log(l3 - l1) + np.log(l3 - l2)
-    log_prior = prior.logpdf(S0_samples, evals_samples) - log_jacobian
+    log_prior = prior.logpdf(S0_samples, evals_samples) - log_jacobian_eig(evals_samples)
     log_lik = likelihood.logpdf(S0_samples, evecs_samples, evals_samples)
 
     log_w = log_prior + log_lik - log_q
@@ -654,34 +665,90 @@ def importance_sampling(*args, **kwargs):
     return importance_weights, S0_samples, evals_samples, evecs_samples
 
 
-def tune_importance_sampling():
-    """Broader but still lightweight ESS search for the IS proposal."""
-    best_gamma = None
-    best_nu = None
-    best_ess = -np.inf
+def tune_importance_sampling(
+    gamma_values=(0.005, 0.01, 0.02, 0.03, 0.05, 0.1),
+    nu_values=(50, 100, 150, 250, 500, 1000, 2000, 4000, 8000),
+    n_seeds=10,
+    n_samples=10000,
+):
+    """Grid search for gamma_S and nu. The ESS of a single run is very noisy, so
+    every setting is run with the same n_seeds seeds and the mean ESS is used."""
+    ess_mean = np.zeros((len(gamma_values), len(nu_values)))
+    ess_std = np.zeros_like(ess_mean)
 
-    gamma_values = np.linspace(0.005, 0.2, 20)
-    nu_values = [1000, 2000, 5000, 10000, 20000, 40000, 80000, 150000]
+    for i, gamma_S in enumerate(gamma_values):
+        for j, nu in enumerate(nu_values):
+            ess = []
+            for seed in range(n_seeds):
+                # __wrapped__ skips the disk cache, so the grid does not fill it up
+                weights, _, _, _ = importance_sampling.__wrapped__(
+                    n_samples=n_samples, gamma_S=gamma_S, nu=nu, seed=seed
+                )
+                ess.append(1.0 / np.sum(weights**2))
+            ess_mean[i, j], ess_std[i, j] = np.mean(ess), np.std(ess)
+            print(f"gamma_S={gamma_S:6.3f} nu={nu:6d} ESS={ess_mean[i, j]:7.1f} +- {ess_std[i, j]:6.1f}")
 
-    for gamma_S in gamma_values:
-        for nu in nu_values:
-            weights, _, _, _ = importance_sampling(
-                force_recompute=True,
-                n_samples=2000,
-                gamma_S=float(gamma_S),
-                nu=int(nu),
-            )
-            ess = 1.0 / np.sum(weights**2)
+    i, j = np.unravel_index(np.argmax(ess_mean), ess_mean.shape)
+    print("BEST:", gamma_values[i], nu_values[j], "mean ESS =", round(ess_mean[i, j], 1))
+    return (gamma_values[i], nu_values[j]), ess_mean, ess_std
 
-            if ess > best_ess:
-                best_ess = ess
-                best_gamma = float(gamma_S)
-                best_nu = int(nu)
 
-            print(f"gamma_S={gamma_S:.4f} nu={nu:7d} ESS={ess:10.2f}")
+# Result of tune_importance_sampling() (highest mean ESS over 10 seeds)
+GAMMA_S_TUNED = 0.05
+NU_TUNED = 150
 
-    print("BEST:", best_gamma, best_nu, "ESS=", round(best_ess, 2))
-    return (best_gamma, best_nu), best_ess
+
+def adaptive_importance_sampling(posterior_vi, n_samples=10000, n_adapt=3, df=5, seed=0):
+    """
+    Importance sampling with an adapted proposal (alternative to the fixed proposal).
+
+    The proposal is a multivariate Student-t over u = (log S0, theta), where theta is
+    the unconstrained Cholesky parameterization of D. Unlike the fixed and the
+    variational proposals it has a full covariance, so it can capture the dependence
+    between S0 and D. Its mean and covariance are estimated from weighted samples:
+    first from an IS run with the variational posterior as proposal, then refined
+    n_adapt times from the previous round. Returns the final round only.
+    """
+    np.random.seed(seed)
+    y, point_estimate, gtab = get_preprocessed_data()
+    prior = frozen_prior()
+    likelihood = frozen_likelihood(gtab, y)
+
+    def log_target(S0, evals, evecs):
+        return (prior.logpdf(S0, evals) - log_jacobian_eig(evals)
+                + likelihood.logpdf(S0, evecs, evals))
+
+    def normalize(log_w):
+        return np.exp(log_w - logsumexp(log_w))
+
+    # Round 0: the fitted variational distribution as proposal
+    q_S0 = gamma(a=posterior_vi.shape, scale=posterior_vi.scale)
+    q_D = wishart(df=posterior_vi.df, scale=posterior_vi.Sigma / posterior_vi.df)
+    S0 = q_S0.rvs(size=n_samples)
+    D = q_D.rvs(size=n_samples)
+    evals, evecs = np.linalg.eigh(D)
+    log_q = q_S0.logpdf(S0) + q_D.logpdf(np.moveaxis(D, 0, -1))
+    weights = normalize(log_target(S0, evals, evecs) - log_q)
+    u = np.column_stack([np.log(S0), np.array([theta_from_D(d) for d in D])])
+    ess_history = [1.0 / np.sum(weights**2)]
+
+    # Rounds 1..n_adapt: Student-t proposal fitted to the previous weighted samples
+    for _ in range(n_adapt):
+        mean = weights @ u
+        cov = np.cov(u.T, aweights=weights)
+        q_u = multivariate_t(loc=mean, shape=cov, df=df)
+        u = q_u.rvs(size=n_samples)
+        S0 = np.exp(u[:, 0])
+        D = D_from_theta(u[:, 1:])
+        evals, evecs = np.linalg.eigh(D)
+        # Density of (S0, D) = density of u / |d(S0, D) / du|.
+        # |dS0/dlogS0| = S0 and |dD/dtheta| = 2^3 L11^4 L22^3 L33^2 with L_ii = exp(theta_ii)
+        log_det = u[:, 0] + 3 * np.log(2) + 4 * u[:, 1] + 3 * u[:, 3] + 2 * u[:, 6]
+        log_q = q_u.logpdf(u) - log_det
+        weights = normalize(log_target(S0, evals, evecs) - log_q)
+        ess_history.append(1.0 / np.sum(weights**2))
+
+    return weights, S0, evals, evecs, ess_history
 
 
 def variational_inference(
@@ -854,6 +921,9 @@ def main():
     # burn_in = 0
     # plot_results(S0_mh[burn_in:], evals_mh[burn_in:], evecs_mh[burn_in:, :, :], evec_principal, method="mh")
 
+    # To redo the hyperparameter search (takes a few minutes), uncomment:
+    # tune_importance_sampling()
+
     # Run Importance Sampling and plot results with the tuned proposal
     # (seeded inside the function, so the figure is the same on every run)
     w_is, S0_is, evals_is, evecs_is = importance_sampling(
@@ -941,34 +1011,71 @@ def main():
     plt.grid(alpha=0.3)
     plt.savefig("Convergence_VI.png", dpi=300, bbox_inches='tight')
 
-    print("Done.")
-    # Plot the ELBO after VI has finished
-    elbo = posterior_vi.elbo_history
+def acute_angle(evals, evecs, evec_ref):
+    # Acute angle (degrees) between each sample's principal eigenvector, i.e. the
+    # one with the largest eigenvalue, and the reference principal direction.
+    # The absolute value is used because v and -v describe the same axis.
+    principal_idx = np.argmax(evals, axis=1)
+    principal_evecs = evecs[np.arange(len(evals)), :, principal_idx]
+    cos = np.abs(principal_evecs @ evec_ref)
+    return np.degrees(np.arccos(np.clip(cos, 0.0, 1.0)))
 
-    plt.figure()
-    plt.plot(elbo, alpha=0.3, label="Raw ELBO estimate")
 
-    # Moving average to make the overall trend visible
-    window = 100
-    smoothed_elbo = np.convolve(
-        elbo,
-        np.ones(window) / window,
-        mode="valid"
-    )
+def weighted_quantiles(x, weights, qs=(0.025, 0.5, 0.975)):
+    # Quantiles of a weighted sample (uniform weights if None)
+    if weights is None:
+        weights = np.ones_like(x) / len(x)
+    order = np.argsort(x)
+    cdf = np.cumsum(weights[order])
+    return x[order][np.searchsorted(cdf, np.array(qs) * cdf[-1])]
 
-    plt.plot(
-        np.arange(window - 1, len(elbo)),
-        smoothed_elbo,
-        linewidth=2,
-        label="100-iteration moving average"
-    )
 
-    plt.xlabel("Iteration")
-    plt.ylabel("Estimated ELBO")
-    plt.title("Variational inference convergence")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.savefig("Convergence_VI.png", dpi=300, bbox_inches='tight')
+def print_intervals(name, S0, evals, evecs, evec_ref, weights=None):
+    S0 = np.asarray(S0).squeeze()
+    quantities = {
+        "S0": S0,
+        "MD": dti.mean_diffusivity(evals).squeeze(),
+        "FA": dti.fractional_anisotropy(evals).squeeze(),
+        "angle (deg)": acute_angle(evals, evecs, evec_ref),
+    }
+    print(name)
+    for label, x in quantities.items():
+        lo, med, hi = weighted_quantiles(x, weights)
+        print(f"  {label:12s} [{lo:.4g}, {med:.4g}, {hi:.4g}]")
+
+
+def plot_comparison(results, evec_ref, filename="comparison.png"):
+    # Overlaid marginal densities for several methods, one panel per quantity.
+    # results: list of (S0, evals, evecs, weights or None, label)
+    colors = ["#2a78d6", "#eb6834", "#1baf7a"]
+    labels = ["$S_0$", "Mean diffusivity ($10^{-4}$ mm$^2$/s)", "Fractional anisotropy", "Acute angle (degrees)"]
+    fig, axes = plt.subplots(1, 4, figsize=(16, 3.4))
+    all_quantities = []
+    for S0, evals, evecs, weights, name in results:
+        all_quantities.append([np.asarray(S0).squeeze(), 1e4 * dti.mean_diffusivity(evals).squeeze(),
+                               dti.fractional_anisotropy(evals).squeeze(),
+                               acute_angle(evals, evecs, evec_ref)])
+    for k, ax in enumerate(axes):
+        # Common bins for all methods, covering 99.8% of each method's mass
+        ends = np.array([weighted_quantiles(q[k], r[3], (0.001, 0.999))
+                         for q, r in zip(all_quantities, results)])
+        bins = np.linspace(ends[:, 0].min(), ends[:, 1].max(), 50)
+        for q, (S0, evals, evecs, weights, name), color in zip(all_quantities, results, colors):
+            ax.hist(q[k], bins=bins, density=True, weights=weights, histtype="step",
+                    linewidth=2, color=color, label=name)
+    for ax, label in zip(axes, labels):
+        ax.set_xlabel(label)
+        ax.set_yticks([])
+        for side in ("top", "right", "left"):
+            ax.spines[side].set_visible(False)
+    axes[0].set_ylabel("Density")
+    handles, names = axes[0].get_legend_handles_labels()
+    fig.legend(handles, names, loc="upper center", ncol=len(results), frameon=False,
+               bbox_to_anchor=(0.5, 1.08), fontsize=11)
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
+
+>>>>>>> f3b5645 (Finalize adaptive IS results)
 
 def plot_results(S0, evals, evecs, evec_ref, weights=None, method=""):
     """
@@ -1059,4 +1166,3 @@ def plot_results(S0, evals, evecs, evec_ref, weights=None, method=""):
 if __name__ == "__main__":
     main()
     check_model()
-
