@@ -1075,7 +1075,6 @@ def plot_comparison(results, evec_ref, filename="comparison.png"):
     plt.tight_layout()
     plt.savefig(filename, dpi=300, bbox_inches="tight")
 
->>>>>>> f3b5645 (Finalize adaptive IS results)
 
 def plot_results(S0, evals, evecs, evec_ref, weights=None, method=""):
     """
